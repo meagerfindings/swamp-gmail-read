@@ -46,7 +46,7 @@ import { z } from "npm:zod@4";
  * nothing personal is hardcoded on an instance). `query` and `maxResults` are
  * the default Gmail search scope, overridable per `list_unread` call.
  */
-const GlobalArgsSchema: z.ZodObject<{
+export const GlobalArgsSchema: z.ZodObject<{
   clientId: z.ZodDefault<z.ZodString>;
   clientSecret: z.ZodDefault<z.ZodString>;
   refreshToken: z.ZodDefault<z.ZodString>;
@@ -83,6 +83,9 @@ const GlobalArgsSchema: z.ZodObject<{
     .describe("Default Gmail search query (Gmail search syntax)."),
   maxResults: z
     .number()
+    .int()
+    .positive()
+    .max(500)
     .default(50)
     .describe("Default max messages to return per call."),
 });
@@ -208,10 +211,11 @@ export async function refreshAccessToken(
     body,
   });
   const text = await res.text();
+  const secrets = [clientSecret, refreshToken];
   if (!res.ok) {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh failed with ${res.status}: ${
-        text.slice(0, 500)
+        redactSecrets(text.slice(0, 500), secrets)
       }`,
     );
   }
@@ -221,14 +225,14 @@ export async function refreshAccessToken(
   } catch {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh returned non-JSON: ${
-        text.slice(0, 200)
+        redactSecrets(text.slice(0, 200), secrets)
       }`,
     );
   }
   if (!parsed.access_token) {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh response had no access_token: ${
-        text.slice(0, 500)
+        redactSecrets(text.slice(0, 500), secrets)
       }`,
     );
   }
@@ -240,48 +244,129 @@ export function bearerHeaders(accessToken: string): Record<string, string> {
   return { Authorization: `Bearer ${accessToken}` };
 }
 
+/**
+ * Redact any occurrence of known secret values from a string before it's
+ * embedded in a thrown error. Error bodies (OAuth/Gmail responses) are
+ * attacker- or Google-controlled text that gets surfaced verbatim in error
+ * messages that may end up in logs, swamp reports, or agent transcripts —
+ * secrets in scope at the throw site (the client secret, refresh token, and
+ * any already-obtained access token) must never leak through that path.
+ * Blank/undefined secrets are skipped (redacting `""` would corrupt the
+ * string by matching everywhere).
+ */
+export function redactSecrets(
+  text: string,
+  secrets: Array<string | undefined>,
+): string {
+  let redacted = text;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+  return redacted;
+}
+
 /** A raw Gmail `messages.list` response (subset used here). */
 type MessagesListResponse = {
   messages?: Array<{ id?: string }>;
+  nextPageToken?: string;
 };
 
+/** The outcome of {@link listMessageIds}: the accumulated ids plus whether
+ * more results existed beyond `maxResults` (Gmail returns `nextPageToken`
+ * when a page isn't the last one). */
+export type ListMessageIdsResult = {
+  ids: string[];
+  truncated: boolean;
+};
+
+/** Maximum Gmail `messages.list` pages {@link listMessageIds} will fetch
+ * for a single call, regardless of `maxResults`. This is a hard ceiling on
+ * network round-trips, independent of the result-count cap — it exists so a
+ * pathological/adversarial response (e.g. an endless stream of
+ * `nextPageToken`s with tiny pages) can't turn one call into an unbounded
+ * loop. `maxResults` is capped at 500 and Gmail pages are up to 500 ids, so
+ * in practice one or two pages satisfy any real call. */
+const MAX_LIST_PAGES = 20;
+
 /**
- * List message ids matching `query`, bounded to `maxResults`. Returns `[]`
- * when the mailbox has no matches (Gmail omits the `messages` array entirely
- * in that case rather than returning an empty one).
+ * List message ids matching `query`, bounded to `maxResults`, following
+ * Gmail's `nextPageToken` pagination as needed to reach that cap. Returns
+ * `{ ids: [], truncated: false }` when the mailbox has no matches (Gmail
+ * omits the `messages` array entirely in that case rather than returning an
+ * empty one). If more results existed beyond `maxResults` when the cap was
+ * reached, `truncated` is `true` so a caller can distinguish "there were
+ * exactly N matches" from "there were more than N and we stopped at N".
  */
 export async function listMessageIds(
   fetchImpl: FetchLike,
   accessToken: string,
   query: string,
   maxResults: number,
-): Promise<string[]> {
-  const url = `${GMAIL_API_BASE}/messages?q=${
-    encodeURIComponent(query)
-  }&maxResults=${maxResults}`;
-  const res = await fetchImpl(url, { headers: bearerHeaders(accessToken) });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(
-      `@mgreten/gmail-read: messages.list failed with ${res.status}: ${
-        text.slice(0, 500)
-      }`,
-    );
+): Promise<ListMessageIdsResult> {
+  const ids: string[] = [];
+  let pageToken: string | undefined;
+  let truncated = false;
+
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const url =
+      `${GMAIL_API_BASE}/messages?q=${
+        encodeURIComponent(query)
+      }&maxResults=${maxResults}` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+    const res = await fetchImpl(url, { headers: bearerHeaders(accessToken) });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(
+        `@mgreten/gmail-read: messages.list failed with ${res.status}: ${
+          redactSecrets(text.slice(0, 500), [accessToken])
+        }`,
+      );
+    }
+    let parsed: MessagesListResponse;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `@mgreten/gmail-read: messages.list returned non-JSON: ${
+          redactSecrets(text.slice(0, 200), [accessToken])
+        }`,
+      );
+    }
+    const rawMessages = parsed.messages;
+    if (rawMessages !== undefined && !Array.isArray(rawMessages)) {
+      throw new Error(
+        `@mgreten/gmail-read: messages.list returned a malformed response ` +
+          `(expected "messages" to be an array): ${
+            redactSecrets(text.slice(0, 200), [accessToken])
+          }`,
+      );
+    }
+    const pageIds = (rawMessages ?? [])
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+    for (const id of pageIds) {
+      if (ids.length >= maxResults) {
+        truncated = true;
+        break;
+      }
+      ids.push(id);
+    }
+
+    if (ids.length >= maxResults) {
+      // Reached the cap. If Gmail still had more to give, flag truncation
+      // even if this exact page happened to end exactly at the cap.
+      truncated = truncated || typeof parsed.nextPageToken === "string";
+      break;
+    }
+    if (!parsed.nextPageToken) {
+      break;
+    }
+    pageToken = parsed.nextPageToken;
   }
-  let parsed: MessagesListResponse;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error(
-      `@mgreten/gmail-read: messages.list returned non-JSON: ${
-        text.slice(0, 200)
-      }`,
-    );
-  }
-  const ids = parsed.messages ?? [];
-  return ids
-    .map((m) => m.id)
-    .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+  return { ids, truncated };
 }
 
 /** A parsed message metadata row: From / Subject / Date / snippet. */
@@ -310,19 +395,29 @@ export function parseMessageMetadata(
   id: string,
   body: MessageMetadataResponse,
 ): MessageItem {
-  const headers = body.payload?.headers ?? [];
+  const rawHeaders = body.payload?.headers;
+  if (rawHeaders !== undefined && !Array.isArray(rawHeaders)) {
+    throw new Error(
+      `@mgreten/gmail-read: messages.get(${id}) returned a malformed ` +
+        `response (expected "payload.headers" to be an array)`,
+    );
+  }
+  const headers = (rawHeaders ?? []).filter(
+    (h): h is { name?: string; value?: string } =>
+      typeof h === "object" && h !== null,
+  );
   const header = (name: string): string => {
     const found = headers.find(
       (h) => (h.name ?? "").toLowerCase() === name.toLowerCase(),
     );
-    return found?.value ?? "";
+    return typeof found?.value === "string" ? found.value : "";
   };
   return {
     id,
     from: header("From"),
     subject: header("Subject"),
     date: header("Date"),
-    snippet: body.snippet ?? "",
+    snippet: typeof body.snippet === "string" ? body.snippet : "",
   };
 }
 
@@ -344,7 +439,7 @@ export async function getMessageMetadata(
   if (!res.ok) {
     throw new Error(
       `@mgreten/gmail-read: messages.get(${id}) failed with ${res.status}: ${
-        text.slice(0, 500)
+        redactSecrets(text.slice(0, 500), [accessToken])
       }`,
     );
   }
@@ -354,34 +449,45 @@ export async function getMessageMetadata(
   } catch {
     throw new Error(
       `@mgreten/gmail-read: messages.get(${id}) returned non-JSON: ${
-        text.slice(0, 200)
+        redactSecrets(text.slice(0, 200), [accessToken])
       }`,
     );
   }
   return parseMessageMetadata(id, parsed);
 }
 
+/** The outcome of {@link getAllMessageMetadata}: the successfully-parsed
+ * items plus how many of `ids` failed. */
+export type AllMessageMetadataResult = {
+  items: MessageItem[];
+  errorCount: number;
+};
+
 /**
  * Fetch metadata for every id in `ids`, skipping (with a logged warning
  * rather than crashing the whole run) any individual message whose
  * `messages.get` call fails — a single transient/deleted-message error
- * shouldn't blank out an otherwise-successful batch.
+ * shouldn't blank out an otherwise-successful batch. `errorCount` lets the
+ * caller distinguish "every fetch failed" (an outage) from "the mailbox is
+ * genuinely empty" — both would otherwise produce an identical `items: []`.
  */
 export async function getAllMessageMetadata(
   fetchImpl: FetchLike,
   accessToken: string,
   ids: string[],
   onSkip?: (id: string, error: unknown) => void,
-): Promise<MessageItem[]> {
+): Promise<AllMessageMetadataResult> {
   const items: MessageItem[] = [];
+  let errorCount = 0;
   for (const id of ids) {
     try {
       items.push(await getMessageMetadata(fetchImpl, accessToken, id));
     } catch (error) {
+      errorCount++;
       onSkip?.(id, error);
     }
   }
-  return items;
+  return { items, errorCount };
 }
 
 /** Result schema for `list_unread`. */
@@ -391,6 +497,9 @@ const ListUnreadResultSchema = z.object({
   query: z.string(),
   maxResults: z.number().int(),
   count: z.number().int(),
+  errorCount: z.number().int(),
+  partialFailure: z.boolean(),
+  truncated: z.boolean(),
   items: z.array(z.object({
     id: z.string(),
     from: z.string(),
@@ -414,6 +523,14 @@ const ListUnreadArgs = z.object({
  * Run the full `list_unread` flow: refresh an access token, search for
  * message ids matching the effective query, then pull metadata for each.
  * `now` is injectable for deterministic tests.
+ *
+ * The result's `ok` flips to `false` only when every attempted
+ * `messages.get` call fails (a total outage) — that's the one case
+ * genuinely indistinguishable from success without a signal, since a
+ * `count: 0` result is otherwise ambiguous between "mailbox empty" and
+ * "every fetch errored". A partial failure (some ids succeeded, some
+ * didn't) keeps `ok: true` but sets `partialFailure: true` so a downstream
+ * CEL consumer can still tell the run wasn't fully clean.
  */
 export async function runListUnread(
   fetchImpl: FetchLike,
@@ -421,6 +538,7 @@ export async function runListUnread(
   args: z.infer<typeof ListUnreadArgs>,
   onSkip?: (id: string, error: unknown) => void,
   now: number = Date.now(),
+  onWarning?: (msg: string, props?: Record<string, unknown>) => void,
 ): Promise<z.infer<typeof ListUnreadResultSchema>> {
   const { clientId, clientSecret, refreshToken } = requireAuth(g);
   const effectiveQuery = args.query ?? g.query;
@@ -432,25 +550,47 @@ export async function runListUnread(
     clientSecret,
     refreshToken,
   );
-  const ids = await listMessageIds(
+  const { ids, truncated } = await listMessageIds(
     fetchImpl,
     accessToken,
     effectiveQuery,
     effectiveMaxResults,
   );
-  const items = await getAllMessageMetadata(
+  if (truncated) {
+    onWarning?.(
+      "list_unread: pagination truncated at maxResults; more messages " +
+        "matched the query than were returned",
+      { query: effectiveQuery, maxResults: effectiveMaxResults },
+    );
+  }
+  const { items, errorCount } = await getAllMessageMetadata(
     fetchImpl,
     accessToken,
     ids,
     onSkip,
   );
+  const partialFailure = errorCount > 0;
+  const allFailed = ids.length > 0 && items.length === 0 && errorCount > 0;
+  if (partialFailure) {
+    onWarning?.(
+      allFailed
+        ? "list_unread: every messages.get call failed; treating as a " +
+          "failed run rather than an empty inbox"
+        : "list_unread: some messages.get calls failed; result is a " +
+          "partial batch",
+      { attempted: ids.length, errorCount },
+    );
+  }
 
   return {
-    ok: true,
+    ok: !allFailed,
     ts: new Date(now).toISOString(),
     query: effectiveQuery,
     maxResults: effectiveMaxResults,
     count: items.length,
+    errorCount,
+    partialFailure,
+    truncated,
     items,
   };
 }
@@ -461,13 +601,14 @@ export async function runListUnread(
  */
 export const model = {
   type: "@mgreten/gmail-read",
-  version: "2026.07.20.1",
+  version: "2026.07.20.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     messages: {
       description:
         "One row per list_unread call: the effective query/maxResults, a " +
-        "count, and the parsed message items (From/Subject/Date/snippet).",
+        "count, errorCount/partialFailure/truncated status flags, and the " +
+        "parsed message items (From/Subject/Date/snippet).",
       schema: ListUnreadResultSchema,
       lifetime: "infinite" as const,
       garbageCollection: 500,
@@ -496,17 +637,34 @@ export const model = {
               error: error instanceof Error ? error.message : String(error),
             });
           },
+          undefined,
+          (msg, props) => {
+            context.logger.warning(msg, props);
+          },
         );
         context.logger.info("list_unread", {
           query: record.query,
           maxResults: record.maxResults,
           count: record.count,
+          errorCount: record.errorCount,
+          partialFailure: record.partialFailure,
+          truncated: record.truncated,
         });
+        // A short random suffix guards against a same-millisecond instance
+        // name collision (e.g. two calls landing in the same Date.now() tick
+        // under heavy concurrency) without needing a full UUID.
+        const suffix = Math.random().toString(36).slice(2, 8);
         const handle = await context.writeResource(
           "messages",
-          `messages-${record.ts}`,
+          `messages-${record.ts}-${suffix}`,
           record,
-          { tags: { count: String(record.count) } },
+          {
+            tags: {
+              count: String(record.count),
+              partialFailure: String(record.partialFailure),
+              truncated: String(record.truncated),
+            },
+          },
         );
         return { dataHandles: [handle] };
       },

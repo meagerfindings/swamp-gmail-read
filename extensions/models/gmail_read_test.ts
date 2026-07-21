@@ -9,10 +9,12 @@ import {
   type FetchLike,
   getAllMessageMetadata,
   getMessageMetadata,
+  GlobalArgsSchema,
   GMAIL_API_BASE,
   listMessageIds,
   OAUTH_TOKEN_URL,
   parseMessageMetadata,
+  redactSecrets,
   refreshAccessToken,
   requireAuth,
   runListUnread,
@@ -149,6 +151,45 @@ Deno.test("refreshAccessToken - throws when the response has no access_token", a
   );
 });
 
+Deno.test("refreshAccessToken - throws a descriptive error on a non-JSON response", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(200, "this is not json"));
+
+  await assertRejects(
+    () => refreshAccessToken(fetchImpl, "cid", "csecret", "rtoken"),
+    Error,
+    "non-JSON",
+  );
+});
+
+Deno.test("refreshAccessToken - redacts clientSecret and refreshToken from a non-2xx error body", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(
+      fakeResponse(
+        400,
+        JSON.stringify({
+          error: "invalid_request",
+          error_description:
+            "client_secret=super-secret-value refresh_token=super-refresh-value is invalid",
+        }),
+      ),
+    );
+
+  const err = await assertRejects(
+    () =>
+      refreshAccessToken(
+        fetchImpl,
+        "cid",
+        "super-secret-value",
+        "super-refresh-value",
+      ),
+    Error,
+  );
+  assert(!err.message.includes("super-secret-value"));
+  assert(!err.message.includes("super-refresh-value"));
+  assert(err.message.includes("[redacted]"));
+});
+
 Deno.test("listMessageIds - calls messages.list with the right q + maxResults, extracts ids", async () => {
   let capturedUrl = "";
   let capturedHeaders: Record<string, string> | undefined;
@@ -163,14 +204,15 @@ Deno.test("listMessageIds - calls messages.list with the right q + maxResults, e
     );
   };
 
-  const ids = await listMessageIds(
+  const result = await listMessageIds(
     fetchImpl,
     "at-abc123",
     "is:unread newer_than:1d",
     50,
   );
 
-  assertEquals(ids, ["m1", "m2"]);
+  assertEquals(result.ids, ["m1", "m2"]);
+  assertEquals(result.truncated, false);
   assert(capturedUrl.startsWith(`${GMAIL_API_BASE}/messages?`));
   assert(
     capturedUrl.includes(
@@ -181,12 +223,124 @@ Deno.test("listMessageIds - calls messages.list with the right q + maxResults, e
   assertEquals(capturedHeaders?.["Authorization"], "Bearer at-abc123");
 });
 
-Deno.test("listMessageIds - empty inbox (no messages array) returns []", async () => {
+Deno.test("listMessageIds - empty inbox (no messages array) returns { ids: [], truncated: false }", async () => {
   const fetchImpl: FetchLike = () =>
     Promise.resolve(fakeResponse(200, JSON.stringify({})));
 
-  const ids = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 50);
-  assertEquals(ids, []);
+  const result = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 50);
+  assertEquals(result.ids, []);
+  assertEquals(result.truncated, false);
+});
+
+Deno.test("listMessageIds - non-2xx response throws a descriptive error", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(403, JSON.stringify({ error: "forbidden" })));
+
+  await assertRejects(
+    () => listMessageIds(fetchImpl, "at-abc123", "is:unread", 50),
+    Error,
+    "403",
+  );
+});
+
+Deno.test("listMessageIds - non-JSON response throws a descriptive error", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(200, "<html>not json</html>"));
+
+  await assertRejects(
+    () => listMessageIds(fetchImpl, "at-abc123", "is:unread", 50),
+    Error,
+    "non-JSON",
+  );
+});
+
+Deno.test("listMessageIds - malformed 'messages' (not an array) throws a structured error, not a raw TypeError", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(
+      fakeResponse(200, JSON.stringify({ messages: "not-an-array" })),
+    );
+
+  await assertRejects(
+    () => listMessageIds(fetchImpl, "at-abc123", "is:unread", 50),
+    Error,
+    "malformed response",
+  );
+});
+
+Deno.test("listMessageIds - follows nextPageToken to accumulate ids across pages", async () => {
+  const seenPageTokens: Array<string | null> = [];
+  const fetchImpl: FetchLike = (url) => {
+    const u = new URL(url);
+    const pageToken = u.searchParams.get("pageToken");
+    seenPageTokens.push(pageToken);
+    if (!pageToken) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({
+            messages: [{ id: "m1" }, { id: "m2" }],
+            nextPageToken: "page-2",
+          }),
+        ),
+      );
+    }
+    return Promise.resolve(
+      fakeResponse(200, JSON.stringify({ messages: [{ id: "m3" }] })),
+    );
+  };
+
+  const result = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 10);
+
+  assertEquals(result.ids, ["m1", "m2", "m3"]);
+  assertEquals(result.truncated, false);
+  assertEquals(seenPageTokens, [null, "page-2"]);
+});
+
+Deno.test("listMessageIds - stops at maxResults and sets truncated:true when more pages remain", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    const u = new URL(url);
+    const pageToken = u.searchParams.get("pageToken");
+    if (!pageToken) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({
+            messages: [{ id: "m1" }, { id: "m2" }],
+            nextPageToken: "page-2",
+          }),
+        ),
+      );
+    }
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          messages: [{ id: "m3" }, { id: "m4" }],
+          nextPageToken: "page-3",
+        }),
+      ),
+    );
+  };
+
+  const result = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 3);
+
+  assertEquals(result.ids, ["m1", "m2", "m3"]);
+  assertEquals(result.truncated, true);
+});
+
+Deno.test("listMessageIds - exactly maxResults matches with no nextPageToken is NOT truncated", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({ messages: [{ id: "m1" }, { id: "m2" }] }),
+      ),
+    );
+
+  const result = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 2);
+
+  assertEquals(result.ids, ["m1", "m2"]);
+  assertEquals(result.truncated, false);
 });
 
 Deno.test("parseMessageMetadata - maps From/Subject/Date/snippet into an item", () => {
@@ -259,6 +413,53 @@ Deno.test("getMessageMetadata - calls messages.get with format=metadata for the 
   assert(capturedUrl.includes("metadataHeaders=Date"));
 });
 
+Deno.test("getMessageMetadata - non-JSON response throws a descriptive error", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(200, "not json at all"));
+
+  await assertRejects(
+    () => getMessageMetadata(fetchImpl, "at-abc123", "m1"),
+    Error,
+    "non-JSON",
+  );
+});
+
+Deno.test("getMessageMetadata - non-2xx response redacts the access token from the thrown error", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(401, "token at-secret-xyz is invalid"));
+
+  const err = await assertRejects(
+    () => getMessageMetadata(fetchImpl, "at-secret-xyz", "m1"),
+    Error,
+  );
+  assert(!err.message.includes("at-secret-xyz"));
+  assert(err.message.includes("[redacted]"));
+});
+
+Deno.test("parseMessageMetadata - malformed 'payload.headers' (not an array) throws a structured error, not a raw TypeError", () => {
+  assertThrows(
+    () =>
+      parseMessageMetadata("m1", {
+        snippet: "hi",
+        // deno-lint-ignore no-explicit-any
+        payload: { headers: "not-an-array" as any },
+      }),
+    Error,
+    "malformed",
+  );
+});
+
+Deno.test("parseMessageMetadata - non-object header entries are ignored rather than throwing", () => {
+  const item = parseMessageMetadata("m1", {
+    snippet: "hi",
+    payload: {
+      // deno-lint-ignore no-explicit-any
+      headers: ["not-an-object" as any, { name: "Subject", value: "ok" }],
+    },
+  });
+  assertEquals(item.subject, "ok");
+});
+
 Deno.test("getAllMessageMetadata - a messages.get failure for one id skips it without crashing the run", async () => {
   const fetchImpl: FetchLike = (url) => {
     if (url.includes("/messages/bad-id")) {
@@ -276,15 +477,33 @@ Deno.test("getAllMessageMetadata - a messages.get failure for one id skips it wi
   };
 
   const skipped: string[] = [];
-  const items = await getAllMessageMetadata(
+  const result = await getAllMessageMetadata(
     fetchImpl,
     "at-abc123",
     ["good-1", "bad-id", "good-2"],
     (id) => skipped.push(id),
   );
 
-  assertEquals(items.map((i) => i.id), ["good-1", "good-2"]);
+  assertEquals(result.items.map((i) => i.id), ["good-1", "good-2"]);
+  assertEquals(result.errorCount, 1);
   assertEquals(skipped, ["bad-id"]);
+});
+
+Deno.test("getAllMessageMetadata - every id failing reports errorCount === attempted count", async () => {
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(500, "internal error"));
+
+  const skipped: string[] = [];
+  const result = await getAllMessageMetadata(
+    fetchImpl,
+    "at-abc123",
+    ["bad-1", "bad-2", "bad-3"],
+    (id) => skipped.push(id),
+  );
+
+  assertEquals(result.items, []);
+  assertEquals(result.errorCount, 3);
+  assertEquals(skipped, ["bad-1", "bad-2", "bad-3"]);
 });
 
 Deno.test("runListUnread - full flow: token refresh -> list -> per-id metadata -> items", async () => {
@@ -371,7 +590,7 @@ Deno.test("runListUnread - args.query/args.maxResults override the global defaul
   assert(listUrl.includes("maxResults=5"));
 });
 
-Deno.test("runListUnread - empty inbox (no messages array) -> count 0, items []", async () => {
+Deno.test("runListUnread - empty inbox (no messages array) -> count 0, items [], ok:true, no partial failure", async () => {
   const fetchImpl: FetchLike = (url) => {
     if (url === OAUTH_TOKEN_URL) {
       return Promise.resolve(
@@ -384,8 +603,12 @@ Deno.test("runListUnread - empty inbox (no messages array) -> count 0, items []"
 
   const result = await runListUnread(fetchImpl, authedGlobalArgs(), {});
 
+  assertEquals(result.ok, true);
   assertEquals(result.count, 0);
   assertEquals(result.items, []);
+  assertEquals(result.errorCount, 0);
+  assertEquals(result.partialFailure, false);
+  assertEquals(result.truncated, false);
 });
 
 Deno.test("runListUnread - throws (via requireAuth) before any fetch when creds are blank", async () => {
@@ -406,4 +629,194 @@ Deno.test("runListUnread - throws (via requireAuth) before any fetch when creds 
     "gmail-refresh-token",
   );
   assertEquals(fetchCalled, false);
+});
+
+Deno.test("runListUnread - all messages.get calls failing -> ok:false, partialFailure:true, distinguishable from an empty inbox", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    if (url.includes("/messages?")) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({ messages: [{ id: "m1" }, { id: "m2" }] }),
+        ),
+      );
+    }
+    // Every messages.get call fails (simulated outage).
+    return Promise.resolve(fakeResponse(500, "internal error"));
+  };
+
+  const warnings: string[] = [];
+  const result = await runListUnread(
+    fetchImpl,
+    authedGlobalArgs(),
+    {},
+    undefined,
+    undefined,
+    (msg) => warnings.push(msg),
+  );
+
+  assertEquals(result.ok, false);
+  assertEquals(result.count, 0);
+  assertEquals(result.items, []);
+  assertEquals(result.errorCount, 2);
+  assertEquals(result.partialFailure, true);
+  assert(warnings.some((w) => w.includes("every messages.get call failed")));
+});
+
+Deno.test("runListUnread - some messages.get calls failing -> ok:true, partialFailure:true", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    if (url.includes("/messages?")) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({ messages: [{ id: "good" }, { id: "bad" }] }),
+        ),
+      );
+    }
+    if (url.includes("/messages/bad")) {
+      return Promise.resolve(fakeResponse(500, "internal error"));
+    }
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          snippet: "ok",
+          payload: { headers: [{ name: "Subject", value: "fine" }] },
+        }),
+      ),
+    );
+  };
+
+  const result = await runListUnread(fetchImpl, authedGlobalArgs(), {});
+
+  assertEquals(result.ok, true);
+  assertEquals(result.count, 1);
+  assertEquals(result.errorCount, 1);
+  assertEquals(result.partialFailure, true);
+});
+
+Deno.test("runListUnread - pagination truncation sets truncated:true and logs a warning", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    if (url.includes("/messages?")) {
+      const u = new URL(url);
+      if (!u.searchParams.get("pageToken")) {
+        return Promise.resolve(
+          fakeResponse(
+            200,
+            JSON.stringify({
+              messages: [{ id: "m1" }],
+              nextPageToken: "page-2",
+            }),
+          ),
+        );
+      }
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ messages: [{ id: "m2" }] })),
+      );
+    }
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          snippet: "ok",
+          payload: { headers: [{ name: "Subject", value: "fine" }] },
+        }),
+      ),
+    );
+  };
+
+  const warnings: string[] = [];
+  const result = await runListUnread(
+    fetchImpl,
+    authedGlobalArgs({ maxResults: 1 }),
+    {},
+    undefined,
+    undefined,
+    (msg) => warnings.push(msg),
+  );
+
+  assertEquals(result.count, 1);
+  assertEquals(result.truncated, true);
+  assert(warnings.some((w) => w.includes("pagination truncated")));
+});
+
+Deno.test("GlobalArgsSchema - maxResults rejects a value above the 500 ceiling", () => {
+  assertThrows(() =>
+    GlobalArgsSchema.parse({
+      clientId: "c",
+      clientSecret: "s",
+      refreshToken: "r",
+      maxResults: 501,
+    })
+  );
+});
+
+Deno.test("GlobalArgsSchema - maxResults rejects non-positive/non-integer values", () => {
+  assertThrows(() =>
+    GlobalArgsSchema.parse({
+      clientId: "c",
+      clientSecret: "s",
+      refreshToken: "r",
+      maxResults: 0,
+    })
+  );
+  assertThrows(() =>
+    GlobalArgsSchema.parse({
+      clientId: "c",
+      clientSecret: "s",
+      refreshToken: "r",
+      maxResults: 1.5,
+    })
+  );
+});
+
+Deno.test("GlobalArgsSchema - maxResults accepts the default and in-bounds values", () => {
+  const parsed = GlobalArgsSchema.parse({
+    clientId: "c",
+    clientSecret: "s",
+    refreshToken: "r",
+  });
+  assertEquals(parsed.maxResults, 50);
+
+  const parsedMax = GlobalArgsSchema.parse({
+    clientId: "c",
+    clientSecret: "s",
+    refreshToken: "r",
+    maxResults: 500,
+  });
+  assertEquals(parsedMax.maxResults, 500);
+});
+
+Deno.test("redactSecrets - replaces every occurrence of each known secret with [redacted]", () => {
+  const text = "client_secret=abc123 and again abc123, refresh_token=xyz789";
+  const result = redactSecrets(text, ["abc123", "xyz789"]);
+  assertEquals(
+    result,
+    "client_secret=[redacted] and again [redacted], refresh_token=[redacted]",
+  );
+});
+
+Deno.test("redactSecrets - ignores blank/undefined secrets rather than corrupting the string", () => {
+  const text = "hello world";
+  assertEquals(redactSecrets(text, ["", undefined]), "hello world");
+});
+
+Deno.test("redactSecrets - no-op when none of the secrets appear in the text", () => {
+  const text = "nothing sensitive here";
+  assertEquals(redactSecrets(text, ["not-present"]), text);
 });

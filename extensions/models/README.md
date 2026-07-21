@@ -109,6 +109,9 @@ Persists a `messages` resource shaped:
   "query": "is:unread newer_than:1d",
   "maxResults": 50,
   "count": 2,
+  "errorCount": 0,
+  "partialFailure": false,
+  "truncated": false,
   "items": [
     {
       "id": "18f2a...",
@@ -124,7 +127,18 @@ Persists a `messages` resource shaped:
 If an individual message's metadata fetch fails (e.g. a transient error or a
 message that was deleted between the search and the fetch), that message is
 skipped with a logged warning rather than failing the whole call — a single
-bad id never blanks out an otherwise-successful batch.
+bad id never blanks out an otherwise-successful batch. `errorCount` counts
+how many `messages.get` calls failed and `partialFailure` is `true` whenever
+`errorCount > 0`, so a downstream CEL consumer can tell "some messages
+skipped" apart from a fully clean run. If **every** attempted `messages.get`
+call fails, `ok` flips to `false` — otherwise a total outage would look
+identical to a genuinely empty inbox (`count: 0, items: []` either way).
+
+`list_unread` follows Gmail's `messages.list` pagination (`nextPageToken`) to
+accumulate ids up to the effective `maxResults`, rather than silently
+returning only the first page. If more messages matched the query than
+`maxResults` allowed, `truncated` is `true` (with a logged warning) so a
+caller knows results were capped rather than exhaustive.
 
 ## How It Works
 
