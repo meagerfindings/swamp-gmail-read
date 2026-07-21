@@ -215,7 +215,7 @@ export async function refreshAccessToken(
   if (!res.ok) {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh failed with ${res.status}: ${
-        redactSecrets(text.slice(0, 500), secrets)
+        redactSecrets(text, secrets).slice(0, 500)
       }`,
     );
   }
@@ -225,18 +225,31 @@ export async function refreshAccessToken(
   } catch {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh returned non-JSON: ${
-        redactSecrets(text.slice(0, 200), secrets)
+        redactSecrets(text, secrets).slice(0, 200)
       }`,
     );
   }
   if (!parsed.access_token) {
     throw new Error(
       `@mgreten/gmail-read: OAuth token refresh response had no access_token: ${
-        redactSecrets(text.slice(0, 500), secrets)
+        redactSecrets(text, secrets).slice(0, 500)
       }`,
     );
   }
   return parsed.access_token;
+}
+
+/**
+ * A short crypto-random suffix (6 hex chars) for disambiguating instance
+ * names created in the same `Date.now()` millisecond tick under concurrency.
+ * Uses `crypto.randomUUID()` rather than `Math.random()` — `Math.random()` is
+ * not a cryptographically secure source and its output is unsuitable
+ * wherever "guess the next value" matters, even for a low-stakes uniqueness
+ * suffix; `crypto.randomUUID()` is available in Deno/modern runtimes with no
+ * extra dependency and removes the debate entirely.
+ */
+export function randomSuffix(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 6);
 }
 
 /** Bearer-auth header for an already-refreshed Gmail API access token. */
@@ -252,7 +265,15 @@ export function bearerHeaders(accessToken: string): Record<string, string> {
  * secrets in scope at the throw site (the client secret, refresh token, and
  * any already-obtained access token) must never leak through that path.
  * Blank/undefined secrets are skipped (redacting `""` would corrupt the
- * string by matching everywhere).
+ * string by matching everywhere — this also covers unconfigured/empty
+ * creds, which must never turn into "every character redacted").
+ *
+ * Also redacts the `encodeURIComponent()` form of each secret, so a secret
+ * that shows up URL-encoded in an error body (e.g. echoed back inside a
+ * query string) is still caught, not just the plain-text form. Callers MUST
+ * redact BEFORE truncating a response body to a preview length — truncating
+ * first can slice through the middle of a secret, leaving a fragment that no
+ * longer matches either form and slips through unredacted.
  */
 export function redactSecrets(
   text: string,
@@ -262,6 +283,10 @@ export function redactSecrets(
   for (const secret of secrets) {
     if (!secret) continue;
     redacted = redacted.split(secret).join("[redacted]");
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) {
+      redacted = redacted.split(encoded).join("[redacted]");
+    }
   }
   return redacted;
 }
@@ -297,18 +322,42 @@ const MAX_LIST_PAGES = 20;
  * empty one). If more results existed beyond `maxResults` when the cap was
  * reached, `truncated` is `true` so a caller can distinguish "there were
  * exactly N matches" from "there were more than N and we stopped at N".
+ *
+ * Ids are deduped across pages (a `Set` tracks ids already accumulated), and
+ * page tokens are tracked too: if a `nextPageToken` repeats a token already
+ * seen (a buggy or adversarial response stuck on one page), pagination
+ * breaks immediately with a logged warning rather than looping to
+ * {@link MAX_LIST_PAGES} on a page that will never advance.
  */
 export async function listMessageIds(
   fetchImpl: FetchLike,
   accessToken: string,
   query: string,
   maxResults: number,
+  onWarning?: (msg: string, props?: Record<string, unknown>) => void,
 ): Promise<ListMessageIdsResult> {
   const ids: string[] = [];
+  const seenIds = new Set<string>();
+  const seenPageTokens = new Set<string>();
   let pageToken: string | undefined;
   let truncated = false;
 
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    if (pageToken) {
+      if (seenPageTokens.has(pageToken)) {
+        // A repeated nextPageToken means the response is stuck (buggy or
+        // adversarial) rather than genuinely paginating — break instead of
+        // burning the rest of the MAX_LIST_PAGES budget on a page we've
+        // already fetched.
+        onWarning?.(
+          "listMessageIds: repeated nextPageToken; stopping pagination " +
+            "instead of looping to the page budget",
+          { pageToken },
+        );
+        break;
+      }
+      seenPageTokens.add(pageToken);
+    }
     const url =
       `${GMAIL_API_BASE}/messages?q=${
         encodeURIComponent(query)
@@ -319,7 +368,7 @@ export async function listMessageIds(
     if (!res.ok) {
       throw new Error(
         `@mgreten/gmail-read: messages.list failed with ${res.status}: ${
-          redactSecrets(text.slice(0, 500), [accessToken])
+          redactSecrets(text, [accessToken]).slice(0, 500)
         }`,
       );
     }
@@ -329,7 +378,7 @@ export async function listMessageIds(
     } catch {
       throw new Error(
         `@mgreten/gmail-read: messages.list returned non-JSON: ${
-          redactSecrets(text.slice(0, 200), [accessToken])
+          redactSecrets(text, [accessToken]).slice(0, 200)
         }`,
       );
     }
@@ -338,7 +387,7 @@ export async function listMessageIds(
       throw new Error(
         `@mgreten/gmail-read: messages.list returned a malformed response ` +
           `(expected "messages" to be an array): ${
-            redactSecrets(text.slice(0, 200), [accessToken])
+            redactSecrets(text, [accessToken]).slice(0, 200)
           }`,
       );
     }
@@ -351,6 +400,11 @@ export async function listMessageIds(
         truncated = true;
         break;
       }
+      // Dedup across pages: a page overlap (e.g. a page boundary shifting
+      // under concurrent mailbox activity) must not double-count or
+      // double-fetch metadata for the same message id.
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
       ids.push(id);
     }
 
@@ -439,7 +493,7 @@ export async function getMessageMetadata(
   if (!res.ok) {
     throw new Error(
       `@mgreten/gmail-read: messages.get(${id}) failed with ${res.status}: ${
-        redactSecrets(text.slice(0, 500), [accessToken])
+        redactSecrets(text, [accessToken]).slice(0, 500)
       }`,
     );
   }
@@ -449,7 +503,7 @@ export async function getMessageMetadata(
   } catch {
     throw new Error(
       `@mgreten/gmail-read: messages.get(${id}) returned non-JSON: ${
-        redactSecrets(text.slice(0, 200), [accessToken])
+        redactSecrets(text, [accessToken]).slice(0, 200)
       }`,
     );
   }
@@ -490,7 +544,13 @@ export async function getAllMessageMetadata(
   return { items, errorCount };
 }
 
-/** Result schema for `list_unread`. */
+/**
+ * Result schema for `list_unread`. The shape is fully known (it's built
+ * entirely in {@link runListUnread} from named fields, not merged from raw
+ * Gmail API responses) — `.passthrough()` was dropped so an extra or
+ * malformed field is caught by validation instead of silently riding along
+ * into the persisted resource.
+ */
 const ListUnreadResultSchema = z.object({
   ok: z.boolean(),
   ts: z.string(),
@@ -507,7 +567,7 @@ const ListUnreadResultSchema = z.object({
     date: z.string(),
     snippet: z.string(),
   })),
-}).passthrough();
+});
 
 /** Argument schema for `list_unread`. */
 const ListUnreadArgs = z.object({
@@ -555,6 +615,7 @@ export async function runListUnread(
     accessToken,
     effectiveQuery,
     effectiveMaxResults,
+    onWarning,
   );
   if (truncated) {
     onWarning?.(
@@ -601,7 +662,7 @@ export async function runListUnread(
  */
 export const model = {
   type: "@mgreten/gmail-read",
-  version: "2026.07.20.2",
+  version: "2026.07.20.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     messages: {
@@ -650,10 +711,11 @@ export const model = {
           partialFailure: record.partialFailure,
           truncated: record.truncated,
         });
-        // A short random suffix guards against a same-millisecond instance
-        // name collision (e.g. two calls landing in the same Date.now() tick
-        // under heavy concurrency) without needing a full UUID.
-        const suffix = Math.random().toString(36).slice(2, 8);
+        // A short crypto-random suffix guards against a same-millisecond
+        // instance name collision (e.g. two calls landing in the same
+        // Date.now() tick under heavy concurrency) without needing a full
+        // UUID in the instance name.
+        const suffix = randomSuffix();
         const handle = await context.writeResource(
           "messages",
           `messages-${record.ts}-${suffix}`,

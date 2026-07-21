@@ -14,6 +14,7 @@ import {
   listMessageIds,
   OAUTH_TOKEN_URL,
   parseMessageMetadata,
+  randomSuffix,
   redactSecrets,
   refreshAccessToken,
   requireAuth,
@@ -819,4 +820,184 @@ Deno.test("redactSecrets - ignores blank/undefined secrets rather than corruptin
 Deno.test("redactSecrets - no-op when none of the secrets appear in the text", () => {
   const text = "nothing sensitive here";
   assertEquals(redactSecrets(text, ["not-present"]), text);
+});
+
+// --- Regression: pagination dedup + repeated-token termination ---
+
+Deno.test("listMessageIds - dedups ids that appear on more than one page", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    const u = new URL(url);
+    const pageToken = u.searchParams.get("pageToken");
+    if (!pageToken) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({
+            messages: [{ id: "m1" }, { id: "m2" }],
+            nextPageToken: "page-2",
+          }),
+        ),
+      );
+    }
+    // Page 2 overlaps with page 1 (m2 repeated) before giving a new id.
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({ messages: [{ id: "m2" }, { id: "m3" }] }),
+      ),
+    );
+  };
+
+  const result = await listMessageIds(fetchImpl, "at-abc123", "is:unread", 10);
+
+  assertEquals(result.ids, ["m1", "m2", "m3"]);
+});
+
+Deno.test("listMessageIds - breaks immediately (with a warning) when nextPageToken repeats, instead of looping to the page budget", async () => {
+  let callCount = 0;
+  const fetchImpl: FetchLike = () => {
+    callCount++;
+    // Every response points back to the same stuck token, forever.
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          messages: [{ id: `m${callCount}` }],
+          nextPageToken: "stuck-token",
+        }),
+      ),
+    );
+  };
+
+  const warnings: Array<{ msg: string; props?: Record<string, unknown> }> = [];
+  const result = await listMessageIds(
+    fetchImpl,
+    "at-abc123",
+    "is:unread",
+    1000,
+    (msg, props) => warnings.push({ msg, props }),
+  );
+
+  // First call has no pageToken; second call uses "stuck-token"; the third
+  // would repeat it, so pagination should stop there instead of running to
+  // MAX_LIST_PAGES (20).
+  assertEquals(callCount, 2);
+  assertEquals(result.ids, ["m1", "m2"]);
+  assert(warnings.some((w) => w.msg.includes("repeated nextPageToken")));
+});
+
+Deno.test("runListUnread - dedup + repeated-token break surface through the full flow", async () => {
+  let listCalls = 0;
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    if (url.includes("/messages?")) {
+      listCalls++;
+      // Always returns the same page + the same nextPageToken.
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({
+            messages: [{ id: "dup-1" }],
+            nextPageToken: "same-token",
+          }),
+        ),
+      );
+    }
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          snippet: "ok",
+          payload: { headers: [{ name: "Subject", value: "fine" }] },
+        }),
+      ),
+    );
+  };
+
+  const result = await runListUnread(fetchImpl, authedGlobalArgs(), {});
+
+  // Only one unique id, and only 2 messages.list calls (first + one repeat
+  // detection), never the full MAX_LIST_PAGES budget.
+  assertEquals(result.items.map((i) => i.id), ["dup-1"]);
+  assertEquals(listCalls, 2);
+});
+
+// --- Regression: redactSecrets URL-encoded form + redact-before-truncate ---
+
+Deno.test("redactSecrets - also redacts the encodeURIComponent() form of a secret", () => {
+  const secret = "s3cr3t value/with+special=chars";
+  const encoded = encodeURIComponent(secret);
+  const text = `error: token ${encoded} rejected`;
+  const result = redactSecrets(text, [secret]);
+  assertEquals(result, "error: token [redacted] rejected");
+});
+
+Deno.test("redactSecrets - empty-string secret is skipped and never corrupts the text", () => {
+  const text = "some perfectly normal error text";
+  // Unconfigured creds arrive as "" — must not turn into every character
+  // (or every gap) being replaced with [redacted].
+  assertEquals(redactSecrets(text, ["", "   ", undefined]), text);
+});
+
+Deno.test("refreshAccessToken - redacts a secret straddling the 500-char truncation boundary", async () => {
+  const secret = "straddling-secret-value";
+  // Grow the padding until the secret's occurrence straddles char 500
+  // exactly (starts before it, ends after it) in the final JSON body — if
+  // truncation ever ran before redaction again, this would leave a partial
+  // (unmatched) fragment of the secret in the visible text.
+  const buildBody = (padLen: number) =>
+    JSON.stringify({
+      error: "invalid_request",
+      error_description: `${"x".repeat(padLen)}${secret}tail`,
+    });
+  let padLen = 400;
+  let body = buildBody(padLen);
+  while (
+    !(body.indexOf(secret) < 500 && body.indexOf(secret) + secret.length > 500) &&
+    padLen < 600
+  ) {
+    padLen++;
+    body = buildBody(padLen);
+  }
+  const secretStart = body.indexOf(secret);
+  assert(secretStart < 500);
+  assert(secretStart + secret.length > 500);
+
+  const fetchImpl: FetchLike = () =>
+    Promise.resolve(fakeResponse(400, body));
+
+  const err = await assertRejects(
+    () => refreshAccessToken(fetchImpl, "cid", secret, "rtoken"),
+    Error,
+  );
+  assert(!err.message.includes(secret));
+  assert(!err.message.includes("straddling-secret-val")); // no partial leak
+});
+
+// --- Regression: crypto-random instance-name suffix ---
+
+Deno.test("randomSuffix - returns a non-empty short string", () => {
+  const suffix = randomSuffix();
+  assert(suffix.length > 0);
+  assert(suffix.length <= 6);
+});
+
+Deno.test("randomSuffix - two consecutive calls are (extremely likely to be) distinct", () => {
+  const a = randomSuffix();
+  const b = randomSuffix();
+  // Not a strict crypto proof, but Math.random()-style collisions on a
+  // 6-hex-char suffix would show up constantly across many draws; a single
+  // crypto.randomUUID()-backed pair should essentially never collide.
+  assert(a !== b);
+});
+
+Deno.test("randomSuffix - produces only lowercase hex characters (crypto.randomUUID-derived)", () => {
+  for (let i = 0; i < 20; i++) {
+    const suffix = randomSuffix();
+    assert(/^[0-9a-f]+$/.test(suffix), `unexpected suffix format: ${suffix}`);
+  }
 });
