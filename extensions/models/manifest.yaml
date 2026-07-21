@@ -1,0 +1,18 @@
+manifestVersion: 1
+name: "@mgreten/gmail-read"
+version: "2026.07.20.1"
+description: >
+  Read-only Gmail reader — list recent/unread messages (From/Subject/Date/
+  snippet) via the Gmail REST API using a vault-wired OAuth refresh token. No
+  write methods by design.
+
+repository: https://github.com/meagerfindings/swamp-gmail-read
+
+models:
+  - gmail_read.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+platforms: []
