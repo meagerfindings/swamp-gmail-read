@@ -8,7 +8,10 @@
  * pulls per-message metadata (From / Subject / Date / snippet) for each
  * matching message id. Every call persists its result as a swamp resource
  * (`messages`) with a zod schema so downstream CEL / `data.latest()` consumers
- * can read `count` and `items`.
+ * can read `count` and `items`. The resource also carries `briefItems`, a
+ * generic pre-shaped `{ kind, title, body }` array derived from each message
+ * — useful for any "summarize these" consumer (not brief-specific) that can't
+ * reshape `items` itself because CEL-in-YAML can't express map literals.
  *
  * ## Auth
  *
@@ -432,6 +435,47 @@ export type MessageItem = {
   snippet: string;
 };
 
+/**
+ * A generic `{ kind, title, body }` shape derived from a {@link MessageItem},
+ * meant for any "summarize these" downstream consumer (a daily-brief
+ * pipeline, a digest, an LLM summarizer) rather than being brief-specific.
+ * `kind` is always the literal `"email"` so a consumer merging items across
+ * multiple source models (calendar, Slack, etc.) can discriminate by source.
+ */
+export type BriefItem = {
+  kind: "email";
+  title: string;
+  body: string;
+};
+
+/** Coerce a possibly-missing field to a string, defaulting to `""` rather
+ * than `undefined`/`null` — {@link toBriefItem} must never throw or produce
+ * an `undefined` field, even from a maximally sparse message. */
+function coerceToString(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+/**
+ * Derive a generic {@link BriefItem} from a {@link MessageItem}. `title` maps
+ * from `subject` (empty string when absent); `body` is a one-line
+ * `From <from> (<date>): <snippet>` summary. Every part is coerced to a
+ * string and missing fields become `""`, so a maximally sparse message (no
+ * subject/snippet/etc.) still produces a valid, never-throwing item.
+ */
+export function toBriefItem(item: MessageItem): BriefItem {
+  const from = coerceToString(item?.from);
+  const date = coerceToString(item?.date);
+  const snippet = coerceToString(item?.snippet);
+  const subject = coerceToString(item?.subject);
+  return {
+    kind: "email",
+    title: subject,
+    body: `From ${from} (${date}): ${snippet}`,
+  };
+}
+
 /** A raw Gmail `messages.get?format=metadata` response (subset used here). */
 type MessageMetadataResponse = {
   snippet?: string;
@@ -567,6 +611,11 @@ const ListUnreadResultSchema = z.object({
     date: z.string(),
     snippet: z.string(),
   })),
+  briefItems: z.array(z.object({
+    kind: z.string(),
+    title: z.string(),
+    body: z.string(),
+  })),
 });
 
 /** Argument schema for `list_unread`. */
@@ -653,6 +702,7 @@ export async function runListUnread(
     partialFailure,
     truncated,
     items,
+    briefItems: items.map(toBriefItem),
   };
 }
 
@@ -662,14 +712,16 @@ export async function runListUnread(
  */
 export const model = {
   type: "@mgreten/gmail-read",
-  version: "2026.07.20.3",
+  version: "2026.07.20.4",
   globalArguments: GlobalArgsSchema,
   resources: {
     messages: {
       description:
         "One row per list_unread call: the effective query/maxResults, a " +
-        "count, errorCount/partialFailure/truncated status flags, and the " +
-        "parsed message items (From/Subject/Date/snippet).",
+        "count, errorCount/partialFailure/truncated status flags, the " +
+        "parsed message items (From/Subject/Date/snippet), and a generic " +
+        "briefItems array ({ kind, title, body }) for any summarizer " +
+        "consumer.",
       schema: ListUnreadResultSchema,
       lifetime: "infinite" as const,
       garbageCollection: 500,

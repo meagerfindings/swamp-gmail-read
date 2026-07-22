@@ -120,9 +120,26 @@ Persists a `messages` resource shaped:
       "date": "Mon, 20 Jul 2026 10:00:00 -0600",
       "snippet": "hey, quick question about..."
     }
+  ],
+  "briefItems": [
+    {
+      "kind": "email",
+      "title": "Quick question",
+      "body": "From Jane Doe <jane@example.com> (Mon, 20 Jul 2026 10:00:00 -0600): hey, quick question about..."
+    }
   ]
 }
 ```
+
+`briefItems` is a generic, pre-shaped `{ kind, title, body }` array derived
+1:1 from `items` (`briefItems.length === items.length`), meant for any
+"summarize these" downstream consumer — not brief-specific. `kind` is always
+the literal `"email"`, `title` maps from `subject` (`""` when absent), and
+`body` is a one-line `From <from> (<date>): <snippet>` summary with every
+part coerced to a string. A message missing `subject`/`from`/`date`/`snippet`
+still produces a valid `briefItem` with empty-string fields — it never
+throws. `items` stays unchanged alongside it so the reader remains a general
+raw Gmail surface, not reshaped for one downstream use.
 
 If an individual message's metadata fetch fails (e.g. a transient error or a
 message that was deleted between the search and the fetch), that message is

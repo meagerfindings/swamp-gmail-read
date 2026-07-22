@@ -19,6 +19,7 @@ import {
   refreshAccessToken,
   requireAuth,
   runListUnread,
+  toBriefItem,
 } from "./gmail_read.ts";
 
 /** Minimal globalArgs fixture with all three auth fields present. */
@@ -1000,4 +1001,163 @@ Deno.test("randomSuffix - produces only lowercase hex characters (crypto.randomU
     const suffix = randomSuffix();
     assert(/^[0-9a-f]+$/.test(suffix), `unexpected suffix format: ${suffix}`);
   }
+});
+
+// --- briefItems: generic { kind, title, body } summarizer shape ---
+
+Deno.test("toBriefItem - maps a fully-populated MessageItem to kind/title/body", () => {
+  const brief = toBriefItem({
+    id: "m1",
+    from: "Jane Doe <jane@example.com>",
+    subject: "Quick question",
+    date: "Mon, 20 Jul 2026 10:00:00 -0600",
+    snippet: "hey, quick question about...",
+  });
+
+  assertEquals(brief, {
+    kind: "email",
+    title: "Quick question",
+    body:
+      "From Jane Doe <jane@example.com> (Mon, 20 Jul 2026 10:00:00 -0600): hey, quick question about...",
+  });
+});
+
+Deno.test("toBriefItem - kind is always the literal 'email'", () => {
+  const brief = toBriefItem({
+    id: "m1",
+    from: "a@b.com",
+    subject: "s",
+    date: "d",
+    snippet: "sn",
+  });
+  assertEquals(brief.kind, "email");
+});
+
+Deno.test("toBriefItem - a message missing subject/from/date/snippet produces empty-string fields, not a crash", () => {
+  const brief = toBriefItem({
+    id: "m1",
+    from: "",
+    subject: "",
+    date: "",
+    snippet: "",
+  });
+
+  assertEquals(brief, {
+    kind: "email",
+    title: "",
+    body: "From  (): ",
+  });
+});
+
+Deno.test("toBriefItem - tolerates undefined/null fields on a maximally sparse item without throwing", () => {
+  // deno-lint-ignore no-explicit-any
+  const sparse = { id: "m1" } as any;
+  const brief = toBriefItem(sparse);
+
+  assertEquals(brief.kind, "email");
+  assertEquals(brief.title, "");
+  assertEquals(brief.body, "From  (): ");
+});
+
+Deno.test("toBriefItem - coerces non-string field values to strings rather than throwing", () => {
+  // deno-lint-ignore no-explicit-any
+  const weird = {
+    id: "m1",
+    from: 123 as any,
+    subject: null as any,
+    date: undefined as any,
+    snippet: false as any,
+  };
+  const brief = toBriefItem(weird);
+
+  assertEquals(brief.title, "");
+  assertEquals(brief.body, "From 123 (): false");
+});
+
+Deno.test("runListUnread - briefItems has one entry per item, in kind/title/body shape", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    if (url.includes("/messages?")) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({ messages: [{ id: "m1" }, { id: "m2" }] }),
+        ),
+      );
+    }
+    if (url.includes("/messages/m1")) {
+      return Promise.resolve(
+        fakeResponse(
+          200,
+          JSON.stringify({
+            snippet: "hello there",
+            payload: {
+              headers: [
+                { name: "From", value: "sender@example.com" },
+                { name: "Subject", value: "Test subject" },
+                { name: "Date", value: "Mon, 20 Jul 2026 10:00:00 -0600" },
+              ],
+            },
+          }),
+        ),
+      );
+    }
+    // m2: no subject/snippet at all.
+    return Promise.resolve(
+      fakeResponse(
+        200,
+        JSON.stringify({
+          payload: {
+            headers: [{ name: "From", value: "other@example.com" }],
+          },
+        }),
+      ),
+    );
+  };
+
+  const result = await runListUnread(
+    fetchImpl,
+    authedGlobalArgs(),
+    {},
+    undefined,
+    Date.parse("2026-07-20T16:00:00Z"),
+  );
+
+  assertEquals(result.count, 2);
+  assertEquals(result.briefItems.length, result.items.length);
+  assertEquals(result.briefItems, [
+    {
+      kind: "email",
+      title: "Test subject",
+      body:
+        "From sender@example.com (Mon, 20 Jul 2026 10:00:00 -0600): hello there",
+    },
+    {
+      kind: "email",
+      title: "",
+      body: "From other@example.com (): ",
+    },
+  ]);
+  assert(result.briefItems.every((b) => b.kind === "email"));
+});
+
+Deno.test("runListUnread - empty inbox produces briefItems: [] alongside items: []", async () => {
+  const fetchImpl: FetchLike = (url) => {
+    if (url === OAUTH_TOKEN_URL) {
+      return Promise.resolve(
+        fakeResponse(200, JSON.stringify({ access_token: "at-abc123" })),
+      );
+    }
+    return Promise.resolve(fakeResponse(200, JSON.stringify({})));
+  };
+
+  const result = await runListUnread(fetchImpl, authedGlobalArgs(), {});
+
+  assertEquals(result.items, []);
+  assertEquals(result.briefItems, []);
+  assertEquals(result.briefItems.length, result.items.length);
 });
