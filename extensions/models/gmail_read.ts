@@ -720,7 +720,7 @@ export async function runListUnread(
  */
 export const model = {
   type: "@mgreten/gmail-read",
-  version: "2026.07.20.5",
+  version: "2026.07.20.6",
   globalArguments: GlobalArgsSchema,
   resources: {
     messages: {
