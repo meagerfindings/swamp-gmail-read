@@ -243,13 +243,21 @@ export async function refreshAccessToken(
 }
 
 /**
- * A short crypto-random suffix (6 hex chars) for disambiguating instance
- * names created in the same `Date.now()` millisecond tick under concurrency.
- * Uses `crypto.randomUUID()` rather than `Math.random()` — `Math.random()` is
- * not a cryptographically secure source and its output is unsuitable
- * wherever "guess the next value" matters, even for a low-stakes uniqueness
- * suffix; `crypto.randomUUID()` is available in Deno/modern runtimes with no
- * extra dependency and removes the debate entirely.
+ * A short crypto-random suffix (6 hex chars). Originally used to disambiguate
+ * per-call `writeResource` instance names created in the same `Date.now()`
+ * millisecond tick under concurrency; the model now writes every `list_unread`
+ * call to a single STABLE instance name (`"messages"`) so downstream
+ * consumers can reference the newest snapshot deterministically via
+ * `data.latest(...)` — swamp's own auto-versioning handles the
+ * same-millisecond-write case, so this is no longer called from the model
+ * body. Kept as an exported utility (harmless, still unit-tested) rather than
+ * deleted, since removing a public export isn't required just because its one
+ * internal caller went away. Uses `crypto.randomUUID()` rather than
+ * `Math.random()` — `Math.random()` is not a cryptographically secure source
+ * and its output is unsuitable wherever "guess the next value" matters, even
+ * for a low-stakes uniqueness suffix; `crypto.randomUUID()` is available in
+ * Deno/modern runtimes with no extra dependency and removes the debate
+ * entirely.
  */
 export function randomSuffix(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 6);
@@ -712,7 +720,7 @@ export async function runListUnread(
  */
 export const model = {
   type: "@mgreten/gmail-read",
-  version: "2026.07.20.4",
+  version: "2026.07.20.5",
   globalArguments: GlobalArgsSchema,
   resources: {
     messages: {
@@ -763,14 +771,17 @@ export const model = {
           partialFailure: record.partialFailure,
           truncated: record.truncated,
         });
-        // A short crypto-random suffix guards against a same-millisecond
-        // instance name collision (e.g. two calls landing in the same
-        // Date.now() tick under heavy concurrency) without needing a full
-        // UUID in the instance name.
-        const suffix = randomSuffix();
+        // Write to a STABLE data name ("messages") rather than a timestamped
+        // one. swamp auto-versions each write under the same name, so history
+        // is preserved (every run is a new version) AND downstream consumers
+        // can reference the newest snapshot deterministically with
+        // `data.latest("<instance>", "messages")` — a timestamped name is
+        // unpredictable and can't be referenced from a workflow step input.
+        // Versioning also subsumes the old same-millisecond collision guard:
+        // concurrent writes become distinct versions, not a name clash.
         const handle = await context.writeResource(
           "messages",
-          `messages-${record.ts}-${suffix}`,
+          "messages",
           record,
           {
             tags: {
